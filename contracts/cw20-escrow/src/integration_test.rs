@@ -97,8 +97,14 @@ fn escrow_happy_path_cw20_tokens() {
     let res = router
         .execute_contract(owner.clone(), cash_addr.clone(), &send_msg, &[])
         .unwrap();
-    println!("{:?}", res.attributes);
-    assert_eq!(6, res.attributes.len());
+    assert_eq!(2, res.events.len());
+    println!("{:?}", res.events);
+    let cw20_attr = res.custom_attrs(0);
+    println!("{:?}", cw20_attr);
+    assert_eq!(4, cw20_attr.len());
+    let escrow_attr = res.custom_attrs(1);
+    println!("{:?}", escrow_attr);
+    assert_eq!(2, escrow_attr.len());
 
     // ensure balances updated
     let owner_balance = cash.balance(&router, owner.clone()).unwrap();

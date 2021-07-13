@@ -27,9 +27,19 @@ pub trait Bank {
     fn clone(&self) -> Box<dyn Bank>;
 }
 
+pub trait BankCommittable {
+    fn mut_store(&mut self) -> &mut dyn Storage;
+}
+
 pub struct BankRouter {
     bank: Box<dyn Bank>,
     storage: Box<dyn Storage>,
+}
+
+impl BankCommittable for BankRouter {
+    fn mut_store(&mut self) -> &mut dyn Storage {
+        self.storage.as_mut()
+    }
 }
 
 impl BankRouter {
@@ -57,23 +67,36 @@ impl BankRouter {
 
 pub struct BankCache<'a> {
     // and this into one with reference
-    router: &'a BankRouter,
+    bank: &'a dyn Bank,
     state: StorageTransaction<'a>,
+}
+
+impl<'a> BankCommittable for BankCache<'a> {
+    fn mut_store(&mut self) -> &mut dyn Storage {
+        &mut self.state
+    }
 }
 
 pub struct BankOps(RepLog);
 
 impl BankOps {
-    pub fn commit(self, router: &mut BankRouter) {
-        self.0.commit(router.storage.as_mut())
+    pub fn commit(self, committable: &mut dyn BankCommittable) {
+        self.0.commit(committable.mut_store())
     }
 }
 
 impl<'a> BankCache<'a> {
     fn new(router: &'a BankRouter) -> Self {
         BankCache {
-            router,
+            bank: router.bank.as_ref(),
             state: StorageTransaction::new(router.storage.as_ref()),
+        }
+    }
+
+    pub fn cache(&self) -> BankCache {
+        BankCache {
+            bank: self.bank,
+            state: StorageTransaction::new(&self.state),
         }
     }
 
@@ -85,7 +108,11 @@ impl<'a> BankCache<'a> {
     }
 
     pub fn execute(&mut self, sender: Addr, msg: BankMsg) -> Result<(), String> {
-        self.router.bank.execute(&mut self.state, sender, msg)
+        self.bank.execute(&mut self.state, sender, msg)
+    }
+
+    pub fn query(&self, request: BankQuery) -> Result<Binary, String> {
+        self.bank.query(&self.state, request)
     }
 }
 
@@ -306,7 +333,7 @@ mod test {
         let bank = SimpleBank {};
         bank.set_balance(&mut store, &owner, init_funds).unwrap();
 
-        // send both tokens
+        // burn both tokens
         let to_burn = vec![coin(30, "eth"), coin(5, "btc")];
         let msg = BankMsg::Burn { amount: to_burn };
         bank.execute(&mut store, owner.clone(), msg).unwrap();
@@ -328,5 +355,76 @@ mod test {
         };
         let err = bank.execute(&mut store, rcpt, msg).unwrap_err();
         assert!(err.contains("Overflow"));
+    }
+
+    fn query_cache(cache: &BankCache, rcpt: &Addr) -> Vec<Coin> {
+        let query = BankQuery::AllBalances {
+            address: rcpt.into(),
+        };
+        let res = cache.query(query).unwrap();
+        let val: AllBalanceResponse = from_slice(&res).unwrap();
+        val.amount
+    }
+
+    fn query_router(cache: &BankRouter, rcpt: &Addr) -> Vec<Coin> {
+        let query = BankQuery::AllBalances {
+            address: rcpt.into(),
+        };
+        let res = cache.query(query).unwrap();
+        let val: AllBalanceResponse = from_slice(&res).unwrap();
+        val.amount
+    }
+
+    #[test]
+    fn multi_level_bank_cache() {
+        let mut store = MockStorage::new();
+
+        let owner = Addr::unchecked("owner");
+        let rcpt = Addr::unchecked("recipient");
+        let init_funds = vec![coin(20, "btc"), coin(100, "eth")];
+
+        // set money
+        let bank = SimpleBank {};
+        bank.set_balance(&mut store, &owner, init_funds).unwrap();
+        let mut router = BankRouter::new(bank, Box::new(store));
+
+        // cache 1 - send some tokens
+        let mut cache = router.cache();
+        let msg = BankMsg::Send {
+            to_address: rcpt.clone().into(),
+            amount: coins(25, "eth"),
+        };
+        cache.execute(owner.clone(), msg).unwrap();
+
+        // shows up in cache
+        let cached_rcpt = query_cache(&cache, &rcpt);
+        assert_eq!(coins(25, "eth"), cached_rcpt);
+        let router_rcpt = query_router(&router, &rcpt);
+        assert_eq!(router_rcpt, vec![]);
+
+        // now, second level cache
+        let mut cache2 = cache.cache();
+        let msg = BankMsg::Send {
+            to_address: rcpt.clone().into(),
+            amount: coins(12, "eth"),
+        };
+        cache2.execute(owner, msg).unwrap();
+
+        // shows up in 2nd cache
+        let cached_rcpt = query_cache(&cache, &rcpt);
+        assert_eq!(coins(25, "eth"), cached_rcpt);
+        let cached2_rcpt = query_cache(&cache2, &rcpt);
+        assert_eq!(coins(37, "eth"), cached2_rcpt);
+
+        // apply second to first
+        let ops = cache2.prepare();
+        ops.commit(&mut cache);
+
+        // apply first to router
+        let ops = cache.prepare();
+        ops.commit(&mut router);
+
+        let committed = query_router(&router, &rcpt);
+        assert_eq!(coins(37, "eth"), committed);
     }
 }
